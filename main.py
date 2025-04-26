@@ -4,6 +4,7 @@ import faiss
 import json
 import re
 import pickle
+import subprocess
 import numpy as np
 import requests
 from typing import List, Dict
@@ -32,23 +33,52 @@ repo = git.Repo(REPO_PATH)
 NULL_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 CACHE_FILE = "commit_embedding_cache.pkl"
+ALLOWED_FILE_EXTENSIONS = [".hs"]  # Configurable list of extensions
 
 def fetch_commits(max_count=500) -> List[Dict]:
     commits = []
     for commit in repo.iter_commits('main', max_count=max_count):
-        diff_data = commit.diff(commit.parents or NULL_TREE, create_patch=True)
-        full_diff = "\n".join(p.diff.decode('utf-8', errors='ignore') for p in diff_data if hasattr(p, 'diff'))
+        commit_hash = commit.hexsha
+        changed_files = list(commit.stats.files.keys())
+
+        # Filter based on allowed extensions
+        if not any(file.endswith(tuple(ALLOWED_FILE_EXTENSIONS)) for file in changed_files):
+            continue
+
+        try:
+            diff_output = subprocess.check_output(
+                ["git", "diff", "-W", f"{commit_hash}^", commit_hash],
+                cwd=REPO_PATH
+            ).decode("utf-8", errors="ignore")
+        except subprocess.CalledProcessError:
+            diff_output = ""
+
+        # Further filter diff to only allowed extensions
+        filtered_blocks = []
+        for block in diff_output.split("diff --git "):
+            lines = block.splitlines()
+            if lines:
+                header_line = lines[0]
+                parts = header_line.split()
+                if len(parts) >= 2:
+                    filename = parts[1].replace("b/", "")
+                    if filename.endswith(tuple(ALLOWED_FILE_EXTENSIONS)):
+                        filtered_blocks.append(block)
+
+        filtered_diff = "\n".join(filtered_blocks)
+
         commits.append({
-            "hash": commit.hexsha,
+            "hash": commit_hash,
             "author": commit.author.name,
             "date": commit.committed_datetime.isoformat(),
             "message": commit.message.strip(),
-            "diff": full_diff,
-            "files": list(commit.stats.files.keys()),
+            "diff": filtered_diff,
+            "files": changed_files,
             "is_merge": len(commit.parents) > 1
         })
     return commits
 
+# --- Helpers ---
 def extract_jira_ids(message: str) -> List[str]:
     return re.findall(r"[A-Z]+-\d+", message)
 
@@ -82,20 +112,18 @@ def chunk_and_summarize(commit: Dict) -> str:
     lines = diff_text.splitlines()
     chunks = []
     current_chunk = ""
-
     for line in lines:
-        if len(current_chunk) + len(line) < 1000:
+        if len(current_chunk) + len(line) < 3000:
             current_chunk += line + "\n"
         else:
             chunks.append(current_chunk)
             current_chunk = line + "\n"
-
     if current_chunk:
         chunks.append(current_chunk)
 
     summaries = []
-
     for chunk in chunks:
+        print("getting summary for chunk", chunk)
         prompt = f"""
 Summarize this code change in simple technical English:
 {chunk}
@@ -105,7 +133,6 @@ Summarize this code change in simple technical English:
             messages=[{"role": "user", "content": prompt}]
         )
         summaries.append(response.choices[0].message.content.strip())
-
     return " ".join(summaries)
 
 def embed_text_azure(texts: List[str]) -> np.ndarray:
@@ -116,90 +143,130 @@ def embed_text_azure(texts: List[str]) -> np.ndarray:
     embeddings = [d.embedding for d in response.data]
     return np.array(embeddings)
 
+# --- Build Vector DB with Per-Commit Cache ---
 def build_vector_db(commits: List[Dict]):
     if os.path.exists(CACHE_FILE):
-        print("Loading cached embeddings...")
+        print("using cache")
         with open(CACHE_FILE, "rb") as f:
-            index, meta = pickle.load(f)
-        return index, meta
+            cache = pickle.load(f)
+    else:
+        cache = {}
 
-    summaries = []
-    meta = []
+    new_cache = {}
+    all_embeddings = []
+    all_meta = []
 
     for commit in commits:
-        commit['type'] = classify_commit_llm(commit['message'])
-        jira_ids = extract_jira_ids(commit['message'])
-        jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
-        commit['jira_ids'] = jira_ids
-        commit['jira_details'] = jira_details
-        commit['summary'] = chunk_and_summarize(commit)
-        summaries.append(commit['summary'] + " " + jira_details)
-        meta.append(commit)
+        print("building for commit:",commit['hash'])
+        commit_hash = commit['hash']
+        if commit_hash in cache:
+            print("reading from cache")
+            entry = cache[commit_hash]
+            embedding = entry['embedding']
+            commit_data = entry['meta']
+        else:
+            commit_type = classify_commit_llm(commit['message'])
+            jira_ids = extract_jira_ids(commit['message'])
+            jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
+            print("chunking is started")
+            summary = chunk_and_summarize(commit)
+            print("chunking is done")
 
-    embeddings = embed_text_azure(summaries)
+            commit_data = commit.copy()
+            commit_data.update({
+                'type': commit_type,
+                'jira_ids': jira_ids,
+                'jira_details': jira_details,
+                'summary': summary
+            })
+            print("embedding start")
+            embedding = embed_text_azure([summary + " " + jira_details])[0]
 
+        new_cache[commit_hash] = {
+            "meta": commit_data,
+            "embedding": embedding
+        }
+
+        all_meta.append(commit_data)
+        all_embeddings.append(embedding)
+
+    embeddings_np = np.vstack(all_embeddings)
     index = faiss.IndexFlatL2(1536)
-    index.add(np.array(embeddings))
+    index.add(embeddings_np)
 
     with open(CACHE_FILE, "wb") as f:
-        pickle.dump((index, meta), f)
+        pickle.dump(new_cache, f)
 
-    return index, meta
+    return index, all_meta
 
+# --- Search and Answer ---
 def search_commits(index, meta, query, top_k=5):
     query_embed = embed_text_azure([query])
     distances, indices = index.search(np.array(query_embed), top_k)
+    return [meta[idx] for idx in indices[0] if idx < len(meta)]
 
-    results = []
-    for idx in indices[0]:
-        if idx < len(meta):
-            results.append(meta[idx])
-    return results
-
-def answer_query(index, meta, question):
-    related_commits = search_commits(index, meta, question)
+def answer_query(index, meta, conversation_history):
     context = "\n".join([
+        f"Q: {turn['question']}\nA: {turn['answer']}" for turn in conversation_history[:-1]
+    ])
+
+    latest_question = conversation_history[-1]['question']
+
+    commits_context = "\n".join([
         f"Commit Hash: {c['hash']}\nAuthor: {c['author']}\nDate: {c['date']}\nIs Merge: {c['is_merge']}\nMessage: {c['message']}\nJIRA IDs: {','.join(c.get('jira_ids', []))}\nJIRA Details: {c.get('jira_details', '')}\nSummary: {c['summary']}\n"
-        for c in related_commits
+        for c in search_commits(index, meta, latest_question)
     ])
 
     prompt = f"""
-You are a senior engineer. Based on the following commit summaries, metadata, and JIRA details, answer the question. Also reference relevant commit hashes when useful.
-Context:
+You are a senior engineer. You are continuing a conversation.
+Previous Conversation:
 {context}
 
-Question: {question}
+Now, based on the following commit summaries and metadata, answer the new question.
+Context:
+{commits_context}
+
+New Question: {latest_question}
 Answer:
 """
-    print("waiting on response")
+
     response = client.chat.completions.create(
         model=DEPLOYMENT_CHAT,
         messages=[{"role": "user", "content": prompt}]
     )
-    print("got response from llm:" , response)
+
     return response.choices[0].message.content.strip()
 
+# --- Streamlit Chatbot UI ---
 def run_streamlit_app(index, metadata):
-    st.title("🔎 Commit History AI Assistant (with JIRA Integration + Cached Embeddings)")
+    st.title("🔎 Commit History Chatbot (with Memory)")
 
-    if st.button("Clear Cache and Reload"):
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-            st.success("Cache cleared! Please restart the app.")
+    if 'conversation' not in st.session_state:
+        st.session_state.conversation = []
+
+    if st.button("Clear Conversation"):
+        st.session_state.conversation = []
 
     query = st.text_input("Ask a question about your codebase:")
 
     if query:
-        with st.spinner("Searching commits and thinking..."):
-            answer = answer_query(index, metadata, query)
-            st.success(answer)
+        st.session_state.conversation.append({"question": query, "answer": ""})
 
+        with st.spinner("Thinking..."):
+            answer = answer_query(index, metadata, st.session_state.conversation)
+            st.session_state.conversation[-1]['answer'] = answer
+
+    for turn in st.session_state.conversation:
+        st.markdown(f"**You:** {turn['question']}")
+        st.markdown(f"**Bot:** {turn['answer']}")
+
+# --- MAIN FLOW ---
 if __name__ == "__main__":
     print("Fetching commits...")
     all_commits = fetch_commits(max_count=6)
 
-    print("Building or Loading vector index...")
+    print("Building or Updating vector index...")
     index, metadata = build_vector_db(all_commits)
 
+    print("starting the app...")
     run_streamlit_app(index, metadata)
-
