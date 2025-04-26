@@ -2,6 +2,7 @@ import os
 import git
 import faiss
 import json
+import time
 import re
 import pickle
 import subprocess
@@ -21,7 +22,7 @@ client = AzureOpenAI(
 DEPLOYMENT_CHAT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 DEPLOYMENT_EMBED = os.getenv("AZURE_OPENAI_DEPLOYMENT_EMBED")
 
-# --- JIRA Settings (Optional) ---
+# --- JIRA Settings ---
 ENABLE_JIRA_FETCH = True
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_AUTH = (os.getenv("JIRA_USER_EMAIL"), os.getenv("JIRA_API_TOKEN"))
@@ -33,15 +34,15 @@ repo = git.Repo(REPO_PATH)
 NULL_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 CACHE_FILE = "commit_embedding_cache.pkl"
-ALLOWED_FILE_EXTENSIONS = [".hs"]  # Configurable list of extensions
+ALLOWED_FILE_EXTENSIONS = [".hs"]
 
+# --- Fetch Commits ---
 def fetch_commits(max_count=500) -> List[Dict]:
     commits = []
     for commit in repo.iter_commits('main', max_count=max_count):
         commit_hash = commit.hexsha
         changed_files = list(commit.stats.files.keys())
 
-        # Filter based on allowed extensions
         if not any(file.endswith(tuple(ALLOWED_FILE_EXTENSIONS)) for file in changed_files):
             continue
 
@@ -53,7 +54,6 @@ def fetch_commits(max_count=500) -> List[Dict]:
         except subprocess.CalledProcessError:
             diff_output = ""
 
-        # Further filter diff to only allowed extensions
         filtered_blocks = []
         for block in diff_output.split("diff --git "):
             lines = block.splitlines()
@@ -107,25 +107,75 @@ Just respond with one word.
     )
     return response.choices[0].message.content.strip().lower()
 
-def chunk_and_summarize(commit: Dict) -> str:
-    diff_text = commit['diff']
+# --- Smart Chunk and Summarize ---
+def is_type_declaration(line: str) -> bool:
+    keywords = ['data ', 'newtype ', 'type ', 'class ', 'instance ']
+    return any(line.lstrip().startswith(k) for k in keywords)
+
+def smart_chunk_diff(diff_text: str, file_extension: str) -> List[str]:
     lines = diff_text.splitlines()
     chunks = []
     current_chunk = ""
-    for line in lines:
-        if len(current_chunk) + len(line) < 3000:
-            current_chunk += line + "\n"
-        else:
+
+    if file_extension != ".hs":
+        # fallback for non-Haskell files
+        for line in lines:
+            if len(current_chunk) + len(line) < 3000:
+                current_chunk += line + "\n"
+            else:
+                chunks.append(current_chunk)
+                current_chunk = line + "\n"
+        if current_chunk:
             chunks.append(current_chunk)
-            current_chunk = line + "\n"
+        return chunks
+
+    # Special Haskell logic
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        if ("::" in stripped or is_type_declaration(stripped) or stripped.startswith("-- |") or ("=" in stripped and not stripped.startswith("--"))):
+            current_chunk += line + "\n"
+            i += 1
+            brace_balance = line.count("{") - line.count("}")
+            while i < len(lines) and (brace_balance > 0 or lines[i].strip() != ""):
+                next_line = lines[i]
+                current_chunk += next_line + "\n"
+                brace_balance += next_line.count("{") - next_line.count("}")
+                i += 1
+            chunks.append(current_chunk)
+            current_chunk = ""
+        else:
+            i += 1
+
     if current_chunk:
         chunks.append(current_chunk)
 
+    return chunks
+
+def smart_chunk_and_summarize(commit: Dict) -> str:
+    diff_text = commit['diff']
+    file_extension = next((os.path.splitext(f)[1] for f in commit['files'] if f.endswith(tuple(ALLOWED_FILE_EXTENSIONS))), ".hs")
+    chunks = smart_chunk_diff(diff_text, file_extension)
+
     summaries = []
     for chunk in chunks:
-        print("getting summary for chunk", chunk)
+        print("generating summary for chunk:", chunk)
         prompt = f"""
-Summarize this code change in simple technical English:
+        You are analyzing a Haskell code change.
+
+Write a detailed, structured technical summary that includes:
+1. **Module and Imports**: Identify the Haskell module name and any import changes if present.
+2. **Changed Entities**: List all functions, types, classes, constants, or instances that were added, removed, or modified.
+3. **Change Context and Flow**: Describe the surrounding patterns, conditions (e.g., case matching, guards), and any functional or dispatch flows impacted or newly introduced.
+4. **Nature of the Change**: Explain exactly what was changed (e.g., added a new handler for a gateway, added new routing logic, updated validation, introduced error handling, etc.).
+5. **Potential System Impact**: Describe if this change could affect other modules, user flows, integrations, or workflows.
+6. **Additional Notes**: Highlight if this code introduces new business flows, new service integration points, core assumption changes, or side-effects.
+
+**Goal**: Write the summary to maximize the chances of finding similar changes later through semantic search. Prioritize clarity, completeness, and technical relevance.
+
+Here is the code diff to analyze:
 {chunk}
 """
         response = client.chat.completions.create(
@@ -133,20 +183,12 @@ Summarize this code change in simple technical English:
             messages=[{"role": "user", "content": prompt}]
         )
         summaries.append(response.choices[0].message.content.strip())
+        print("summary for this: \n", summaries[-1])
     return " ".join(summaries)
-
-def embed_text_azure(texts: List[str]) -> np.ndarray:
-    response = client.embeddings.create(
-        model=DEPLOYMENT_EMBED,
-        input=texts
-    )
-    embeddings = [d.embedding for d in response.data]
-    return np.array(embeddings)
 
 # --- Build Vector DB with Per-Commit Cache ---
 def build_vector_db(commits: List[Dict]):
     if os.path.exists(CACHE_FILE):
-        print("using cache")
         with open(CACHE_FILE, "rb") as f:
             cache = pickle.load(f)
     else:
@@ -157,20 +199,18 @@ def build_vector_db(commits: List[Dict]):
     all_meta = []
 
     for commit in commits:
-        print("building for commit:",commit['hash'])
         commit_hash = commit['hash']
         if commit_hash in cache:
-            print("reading from cache")
+            print("using existing vector index for commit:", commit)
             entry = cache[commit_hash]
             embedding = entry['embedding']
             commit_data = entry['meta']
         else:
+            print("building vector index for commit:", commit)
             commit_type = classify_commit_llm(commit['message'])
             jira_ids = extract_jira_ids(commit['message'])
             jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
-            print("chunking is started")
-            summary = chunk_and_summarize(commit)
-            print("chunking is done")
+            summary = smart_chunk_and_summarize(commit)
 
             commit_data = commit.copy()
             commit_data.update({
@@ -179,7 +219,7 @@ def build_vector_db(commits: List[Dict]):
                 'jira_details': jira_details,
                 'summary': summary
             })
-            print("embedding start")
+
             embedding = embed_text_azure([summary + " " + jira_details])[0]
 
         new_cache[commit_hash] = {
@@ -198,6 +238,14 @@ def build_vector_db(commits: List[Dict]):
         pickle.dump(new_cache, f)
 
     return index, all_meta
+
+def embed_text_azure(texts: List[str]) -> np.ndarray:
+    response = client.embeddings.create(
+        model=DEPLOYMENT_EMBED,
+        input=texts
+    )
+    embeddings = [d.embedding for d in response.data]
+    return np.array(embeddings)
 
 # --- Search and Answer ---
 def search_commits(index, meta, query, top_k=5):
@@ -218,18 +266,16 @@ def answer_query(index, meta, conversation_history):
     ])
 
     prompt = f"""
-You are a senior engineer. You are continuing a conversation.
+You are a senior engineer, Always answer based on the context don't answer outside of context if can't answer then simply say can't find relevant commit. Continue this conversation based on previous context and commit summaries.
 Previous Conversation:
 {context}
 
-Now, based on the following commit summaries and metadata, answer the new question.
-Context:
+New Context from Commits:
 {commits_context}
 
 New Question: {latest_question}
 Answer:
 """
-
     response = client.chat.completions.create(
         model=DEPLOYMENT_CHAT,
         messages=[{"role": "user", "content": prompt}]
@@ -239,7 +285,7 @@ Answer:
 
 # --- Streamlit Chatbot UI ---
 def run_streamlit_app(index, metadata):
-    st.title("🔎 Commit History Chatbot (with Memory)")
+    st.title("🔎 Commit History Chatbot (Smart Chunking + Memory)")
 
     if 'conversation' not in st.session_state:
         st.session_state.conversation = []
@@ -263,10 +309,9 @@ def run_streamlit_app(index, metadata):
 # --- MAIN FLOW ---
 if __name__ == "__main__":
     print("Fetching commits...")
-    all_commits = fetch_commits(max_count=6)
+    all_commits = fetch_commits(max_count=2)
 
-    print("Building or Updating vector index...")
     index, metadata = build_vector_db(all_commits)
 
-    print("starting the app...")
     run_streamlit_app(index, metadata)
+
