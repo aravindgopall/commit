@@ -1,84 +1,66 @@
 import os
 import git
-import faiss
-import json
-import time
-import re
-import pickle
 import subprocess
+import pickle
+import re
+import json
 import numpy as np
 import requests
-from typing import List, Dict
+from collections import defaultdict
 import streamlit as st
 from openai import AzureOpenAI
+from typing import List, Dict, Any, Optional, Union
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+from qdrant_client.http.models import PointStruct, Distance, VectorParams
 
-# --- Setup Azure OpenAI Client ---
+
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
 )
-
 DEPLOYMENT_CHAT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 DEPLOYMENT_EMBED = os.getenv("AZURE_OPENAI_DEPLOYMENT_EMBED")
 
-# --- JIRA Settings ---
+
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "git_hunks")
+EMBEDDING_DIM = 1536  
+
+
 ENABLE_JIRA_FETCH = True
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_AUTH = (os.getenv("JIRA_USER_EMAIL"), os.getenv("JIRA_API_TOKEN"))
 
-# --- Setup Repo ---
-REPO_PATH = "path"
+
+REPO_PATH = "/Users/pramod.p/euler-api-gateway/"
 repo = git.Repo(REPO_PATH)
+ALLOWED_FILE_EXTENSIONS = [".hs", ".py", ".ts", ".go"]
 
-NULL_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
-CACHE_FILE = "commit_embedding_cache.pkl"
-ALLOWED_FILE_EXTENSIONS = [".hs"]
+HIERARCHY_CACHE_FILE = "intent_hierarchy_cache.pkl"
 
-# --- Fetch Commits ---
-def fetch_commits(max_count=500) -> List[Dict]:
-    commits = []
-    for commit in repo.iter_commits('main', max_count=max_count):
-        commit_hash = commit.hexsha
-        changed_files = list(commit.stats.files.keys())
 
-        if not any(file.endswith(tuple(ALLOWED_FILE_EXTENSIONS)) for file in changed_files):
-            continue
+def init_qdrant_client():
+    """Initialize Qdrant client and ensure collection exists"""
+    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    
 
-        try:
-            diff_output = subprocess.check_output(
-                ["git", "diff", "-W", f"{commit_hash}^", commit_hash],
-                cwd=REPO_PATH
-            ).decode("utf-8", errors="ignore")
-        except subprocess.CalledProcessError:
-            diff_output = ""
+    collections = qdrant_client.get_collections().collections
+    collection_names = [c.name for c in collections]
+    
+    if QDRANT_COLLECTION not in collection_names:
+        qdrant_client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        )
+        print(f"Created new Qdrant collection: {QDRANT_COLLECTION}")
+    
+    return qdrant_client
 
-        filtered_blocks = []
-        for block in diff_output.split("diff --git "):
-            lines = block.splitlines()
-            if lines:
-                header_line = lines[0]
-                parts = header_line.split()
-                if len(parts) >= 2:
-                    filename = parts[1].replace("b/", "")
-                    if filename.endswith(tuple(ALLOWED_FILE_EXTENSIONS)):
-                        filtered_blocks.append(block)
 
-        filtered_diff = "\n".join(filtered_blocks)
-
-        commits.append({
-            "hash": commit_hash,
-            "author": commit.author.name,
-            "date": commit.committed_datetime.isoformat(),
-            "message": commit.message.strip(),
-            "diff": filtered_diff,
-            "files": changed_files,
-            "is_merge": len(commit.parents) > 1
-        })
-    return commits
-
-# --- Helpers ---
 def extract_jira_ids(message: str) -> List[str]:
     return re.findall(r"[A-Z]+-\d+", message)
 
@@ -95,6 +77,7 @@ def fetch_jira_description(jira_id: str) -> str:
     except Exception as e:
         return f"[Error fetching JIRA {jira_id}: {e}]"
 
+
 def classify_commit_llm(message: str) -> str:
     prompt = f"""
 Classify the following commit message into one of the categories: Feature, Bugfix, Refactor, Documentation, Test, Other.
@@ -107,139 +90,321 @@ Just respond with one word.
     )
     return response.choices[0].message.content.strip().lower()
 
-# --- Smart Chunk and Summarize ---
-def is_type_declaration(line: str) -> bool:
-    keywords = ['data ', 'newtype ', 'type ', 'class ', 'instance ']
-    return any(line.lstrip().startswith(k) for k in keywords)
 
-def smart_chunk_diff(diff_text: str, file_extension: str) -> List[str]:
-    lines = diff_text.splitlines()
-    chunks = []
-    current_chunk = ""
+def fetch_commits(max_count):
+    commits = []
+    i = 1
+    for commit in repo.iter_commits('staging', max_count=max_count):
+        print(f"fetching commit {i}/{max_count}")
+        commit_hash = commit.hexsha
+        changed_files = list(commit.stats.files.keys())
+        if not any(file.endswith(tuple(ALLOWED_FILE_EXTENSIONS)) for file in changed_files):
+            continue
 
-    if file_extension != ".hs":
-        # fallback for non-Haskell files
-        for line in lines:
-            if len(current_chunk) + len(line) < 3000:
-                current_chunk += line + "\n"
-            else:
-                chunks.append(current_chunk)
-                current_chunk = line + "\n"
-        if current_chunk:
-            chunks.append(current_chunk)
-        return chunks
+        try:
+            diff_output = subprocess.check_output(
+                ["git", "diff", "-U0", f"{commit_hash}^", commit_hash],
+                cwd=REPO_PATH
+            ).decode("utf-8", errors="ignore")
+        except subprocess.CalledProcessError:
+            diff_output = ""
 
-    # Special Haskell logic
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.lstrip()
+        jira_ids = extract_jira_ids(commit.message)
+        jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
+        commit_type = classify_commit_llm(commit.message)
 
-        if ("::" in stripped or is_type_declaration(stripped) or stripped.startswith("-- |") or ("=" in stripped and not stripped.startswith("--"))):
-            current_chunk += line + "\n"
-            i += 1
-            brace_balance = line.count("{") - line.count("}")
-            while i < len(lines) and (brace_balance > 0 or lines[i].strip() != ""):
-                next_line = lines[i]
-                current_chunk += next_line + "\n"
-                brace_balance += next_line.count("{") - next_line.count("}")
-                i += 1
-            chunks.append(current_chunk)
-            current_chunk = ""
-        else:
-            i += 1
+        commits.append({
+            "hash": commit_hash,
+            "message": commit.message.strip(),
+            "diff": diff_output,
+            "author": commit.author.name,
+            "date": commit.committed_datetime.isoformat(),
+            "jira_ids": jira_ids,
+            "jira_details": jira_details,
+            "type": commit_type
+        })
+        i+=1
+    return commits
 
-    if current_chunk:
-        chunks.append(current_chunk)
+def fetch_given_commits(commit_hashes: List[str]) -> List[Dict]:
+    """Fetch specific commits (provided manually) and their diffs from the repository"""
+    commits = []
+    for i, commit_hash in enumerate(commit_hashes, start=1):
+        print(f"fetching commit {i}/{len(commit_hashes)}: {commit_hash}")
+        
+        try:
+            commit = repo.commit(commit_hash)
+        except Exception as e:
+            print(f"Error fetching commit {commit_hash}: {e}")
+            continue
+        
+        changed_files = list(commit.stats.files.keys())
+        if not any(file.endswith(tuple(ALLOWED_FILE_EXTENSIONS)) for file in changed_files):
+            print("skipped one")
+            continue
+        
+        try:
+            diff_output = subprocess.check_output(
+                ["git", "diff", "-W", f"{commit_hash}^", commit_hash],
+                cwd=REPO_PATH
+            ).decode("utf-8", errors="ignore")
+        except subprocess.CalledProcessError:
+            diff_output = ""
 
-    return chunks
+        jira_ids = extract_jira_ids(commit.message)
+        jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
+        commit_type = classify_commit_llm(commit.message)
 
-def smart_chunk_and_summarize(commit: Dict) -> str:
-    diff_text = commit['diff']
-    file_extension = next((os.path.splitext(f)[1] for f in commit['files'] if f.endswith(tuple(ALLOWED_FILE_EXTENSIONS))), ".hs")
-    chunks = smart_chunk_diff(diff_text, file_extension)
+        commits.append({
+            "hash": commit_hash,
+            "message": commit.message.strip(),
+            "diff": diff_output,
+            "author": commit.author.name,
+            "date": commit.committed_datetime.isoformat(),
+            "jira_ids": jira_ids,
+            "jira_details": jira_details,
+            "type": commit_type
+        })
+    return commits
 
-    summaries = []
-    for chunk in chunks:
-        print("generating summary for chunk:", chunk)
-        prompt = f"""
-        You are analyzing a Haskell code change.
 
-Write a detailed, structured technical summary that includes:
-1. **Module and Imports**: Identify the Haskell module name and any import changes if present.
-2. **Changed Entities**: List all functions, types, classes, constants, or instances that were added, removed, or modified.
-3. **Change Context and Flow**: Describe the surrounding patterns, conditions (e.g., case matching, guards), and any functional or dispatch flows impacted or newly introduced.
-4. **Nature of the Change**: Explain exactly what was changed (e.g., added a new handler for a gateway, added new routing logic, updated validation, introduced error handling, etc.).
-5. **Potential System Impact**: Describe if this change could affect other modules, user flows, integrations, or workflows.
-6. **Additional Notes**: Highlight if this code introduces new business flows, new service integration points, core assumption changes, or side-effects.
 
-**Goal**: Write the summary to maximize the chances of finding similar changes later through semantic search. Prioritize clarity, completeness, and technical relevance.
+def split_diff_into_hunks(diff_text: str) -> List[str]:
+    hunks = []
+    current_hunk = []
+    for line in diff_text.splitlines():
+        if line.startswith('@@'):
+            if current_hunk:
+                hunks.append('\n'.join(current_hunk))
+                current_hunk = []
 
-Here is the code diff to analyze:
-{chunk}
+        if not line.startswith('-'):
+            current_hunk.append(line)
+    if current_hunk:
+        hunks.append('\n'.join(current_hunk))
+    return hunks
+
+
+def detect_hunk_intent(hunk_text: str) -> Dict[str, str]:
+    """
+    Enhanced function to detect the intent of a hunk with detailed explanation.
+    Returns both a short intent summary and a detailed explanation of the workflow.
+    """
+    prompt = f"""
+You are analyzing a code diff hunk.
+
+Please provide:
+1. A SHORT INTENT summary of this hunk in 1 short sentence (less than 10 words).
+2. A DETAILED EXPLANATION of the workflow and purpose of these changes (3-5 sentences).
+
+Focus on both high-level intent and technical details.
+
+Here is the hunk:
+{hunk_text}
+
+Format your response as:
+SHORT_INTENT: [your short intent here]
+DETAILED_EXPLANATION: [your detailed explanation here]
 """
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_CHAT,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        summaries.append(response.choices[0].message.content.strip())
-        print("summary for this: \n", summaries[-1])
-    return " ".join(summaries)
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_CHAT,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    result_text = response.choices[0].message.content.strip()
+    
 
-# --- Build Vector DB with Per-Commit Cache ---
-def build_vector_db(commits: List[Dict]):
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "rb") as f:
-            cache = pickle.load(f)
-    else:
-        cache = {}
+    short_intent = ""
+    detailed_explanation = ""
+    
+    lines = result_text.split('\n')
+    for line in lines:
+        if line.startswith("SHORT_INTENT:"):
+            short_intent = line[len("SHORT_INTENT:"):].strip().lower()
+        elif line.startswith("DETAILED_EXPLANATION:"):
+            detailed_explanation = line[len("DETAILED_EXPLANATION:"):].strip()
+    
 
-    new_cache = {}
-    all_embeddings = []
-    all_meta = []
+    if not short_intent:
+        short_intent = result_text.lower()
+        detailed_explanation = result_text
+    
+    return {
+        "short_intent": short_intent,
+        "detailed_explanation": detailed_explanation
+    }
 
-    for commit in commits:
-        commit_hash = commit['hash']
-        if commit_hash in cache:
-            print("using existing vector index for commit:", commit)
-            entry = cache[commit_hash]
-            embedding = entry['embedding']
-            commit_data = entry['meta']
-        else:
-            print("building vector index for commit:", commit)
-            commit_type = classify_commit_llm(commit['message'])
-            jira_ids = extract_jira_ids(commit['message'])
-            jira_details = " ".join([fetch_jira_description(jid) for jid in jira_ids])
-            summary = smart_chunk_and_summarize(commit)
 
-            commit_data = commit.copy()
-            commit_data.update({
-                'type': commit_type,
-                'jira_ids': jira_ids,
-                'jira_details': jira_details,
-                'summary': summary
+def group_hunks_by_intent(commits: List[Dict]) -> Dict[str, List[Dict]]:
+    grouped = defaultdict(list)
+    for i, commit in enumerate(commits):
+        print(f"Processing commit {i+1}/{len(commits)}")
+        hunks = split_diff_into_hunks(commit['diff'])
+        for idx, hunk in enumerate(hunks):
+            if not hunk.strip():
+                continue
+            
+            intent_data = detect_hunk_intent(hunk)
+            short_intent = intent_data["short_intent"]
+            detailed_explanation = intent_data["detailed_explanation"]
+            
+            grouped[short_intent].append({
+                "commit": commit,
+                "hunk": hunk,
+                "hunk_id": f"{commit['hash']}_{idx}",
+                "intent": short_intent,
+                "detailed_explanation": detailed_explanation,
+                "jira_ids": commit.get('jira_ids', []),
+                "jira_details": commit.get('jira_details', ''),
+                "commit_type": commit.get('type', 'unknown')
             })
+    return grouped
 
-            embedding = embed_text_azure([summary + " " + jira_details])[0]
 
-        new_cache[commit_hash] = {
-            "meta": commit_data,
-            "embedding": embedding
-        }
+def parse_alternate_response(response: str):
+    """
+    Parses the structured response from LLM into a dictionary of categories and their intents.
+    
+    Example response:
+    Category: Transaction Handling
+    Intents:
+    - add handling for verify.nb parameter types in transaction processing
+    - add pre-transaction validation logic
 
-        all_meta.append(commit_data)
-        all_embeddings.append(embedding)
+    Returns a dictionary of categories with intents.
+    """
+    categories = {}
+    current_category = None
+    current_intents = []
 
-    embeddings_np = np.vstack(all_embeddings)
-    index = faiss.IndexFlatL2(1536)
-    index.add(embeddings_np)
 
-    with open(CACHE_FILE, "wb") as f:
-        pickle.dump(new_cache, f)
+    lines = response.split('\n')
 
-    return index, all_meta
+    for line in lines:
+        line = line.strip()  # Clean up whitespace
 
-def embed_text_azure(texts: List[str]) -> np.ndarray:
+        if line.startswith("Category:"):
+
+            if current_category:
+                categories[current_category] = current_intents
+
+
+            current_category = line[len("Category:"):].strip()
+            current_intents = []
+
+        elif line.startswith("-"):
+
+            current_intents.append(line[len("-"):].strip())
+
+
+    if current_category:
+        categories[current_category] = current_intents
+
+    return categories
+
+
+def group_intents_with_llm(grouped_hunks: Dict[str, List[Dict]], predefined_categories=None):
+    """
+    Create or update higher-level categories from existing lower-level intents using LLM.
+    Made more generic by allowing optional predefined categories and customizable grouping logic.
+    
+    Args:
+        grouped_hunks: Dictionary of intents mapped to their hunks
+        predefined_categories: Optional list of predefined category names to guide the grouping
+    
+    Returns:
+        Dictionary mapping high-level categories to their constituent intents
+    """
+    intent_hierarchy = {}
+
+
+    all_intents = list(grouped_hunks.keys())
+
+
+    batch_size = 15
+    num_batches = (len(all_intents) + batch_size - 1) // batch_size
+
+    for i in range(0, len(all_intents), batch_size):
+        batch_intents = all_intents[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        print(f"Grouping new intents: batch {batch_num}/{num_batches}")
+
+
+        intent_list = "\n".join([f"- {intent}" for intent in batch_intents])
+        
+
+        if predefined_categories:
+            categories_list = "\n".join([f"- {cat}" for cat in predefined_categories])
+            prompt = f"""
+You are an expert software architect analyzing code change intents.
+
+Below is a list of specific code change intents:
+{intent_list}
+
+Group these intents into the following predefined categories:
+{categories_list}
+
+For each category, list which of the original intents belong to that category.
+Only use the predefined categories - do not create new ones.
+
+Please provide the response in the following format:
+
+Category: [Category Name]
+Intents:
+- [intent1]
+- [intent2]
+- [intent3]
+...
+"""
+        else:
+            prompt = f"""
+You are an expert software architect analyzing code change intents.
+
+Below is a list of specific code change intents:
+{intent_list}
+
+Group these intents into 2-4 meaningful, generic categories. For each category:
+1. Create a concise, domain-agnostic name (3-5 words).
+2. List which of the original intents belong to that category.
+3. Ensure categories are appropriately abstract and could apply across different codebases.
+
+Please provide the response in the following format:
+
+Category: [Category Name]
+Intents:
+- [intent1]
+- [intent2]
+- [intent3]
+...
+"""
+
+        try:
+
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_CHAT,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+
+            if response.choices and response.choices[0].message.content.strip():
+                result = parse_alternate_response(response.choices[0].message.content.strip())
+
+
+                for category, intents in result.items():
+                    if category in intent_hierarchy:
+                        intent_hierarchy[category].extend(intents)
+                    else:
+                        intent_hierarchy[category] = intents
+            else:
+                print(f"Empty or invalid response for batch {batch_num}. Skipping...")
+
+        except Exception as e:
+            print(f"Error during API call for batch {batch_num}: {e}. Skipping this batch.")
+
+    return intent_hierarchy
+
+
+def embed_texts_azure(texts: List[str]) -> np.ndarray:
     response = client.embeddings.create(
         model=DEPLOYMENT_EMBED,
         input=texts
@@ -247,51 +412,343 @@ def embed_text_azure(texts: List[str]) -> np.ndarray:
     embeddings = [d.embedding for d in response.data]
     return np.array(embeddings)
 
-# --- Search and Answer ---
-def search_commits(index, meta, query, top_k=5):
-    query_embed = embed_text_azure([query])
-    distances, indices = index.search(np.array(query_embed), top_k)
-    return [meta[idx] for idx in indices[0] if idx < len(meta)]
 
-def answer_query(index, meta, conversation_history):
-    context = "\n".join([
-        f"Q: {turn['question']}\nA: {turn['answer']}" for turn in conversation_history[:-1]
-    ])
+def build_qdrant_db(qdrant_client, grouped_hunks: Dict[str, List[Dict]]):
+    """
+    Build or update the Qdrant collection with hunk embeddings and metadata.
+    Embeds both the short intent and detailed explanation.
+    """
 
-    latest_question = conversation_history[-1]['question']
+    try:
+        existing_points = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=qmodels.Filter(),
+            limit=10000  # Adjust if you have more points
+        )[0]
+        existing_ids = {p.id for p in existing_points}
+        print(f"Found {len(existing_ids)} existing points in Qdrant")
+    except Exception as e:
+        print(f"Error checking existing points: {e}")
+        existing_ids = set()
 
-    commits_context = "\n".join([
-        f"Commit Hash: {c['hash']}\nAuthor: {c['author']}\nDate: {c['date']}\nIs Merge: {c['is_merge']}\nMessage: {c['message']}\nJIRA IDs: {','.join(c.get('jira_ids', []))}\nJIRA Details: {c.get('jira_details', '')}\nSummary: {c['summary']}\n"
-        for c in search_commits(index, meta, latest_question)
-    ])
 
+    points_to_upsert = []
+    all_metadata = []
+    
+
+    for intent, hunks in grouped_hunks.items():
+        for hunk_info in hunks:
+            hunk_id = hunk_info['hunk_id']
+
+            numerical_id = int(hash(hunk_id) % (10**10))
+            
+
+            if numerical_id in existing_ids:
+                print(f"Skipping existing hunk_id: {hunk_id}")
+                continue
+            
+
+            detailed_explanation = hunk_info.get('detailed_explanation', "")
+            
+
+            metadata_dict = {
+                "intent": intent,
+                "hunk_id": hunk_id,
+                "commit_hash": hunk_info['commit']['hash'],
+                "commit_message": hunk_info['commit']['message'],
+                "commit_author": hunk_info['commit']['author'],
+                "commit_date": hunk_info['commit']['date'],
+                "jira_ids": ",".join(hunk_info.get('jira_ids', [])),
+                "jira_details": hunk_info.get('jira_details', ''),
+                "commit_type": hunk_info.get('commit_type', 'unknown'),
+                "detailed_explanation": detailed_explanation,
+                "hunk_text": hunk_info['hunk']
+            }
+            
+
+            all_metadata.append(metadata_dict)
+            
+
+            points_to_upsert.append({
+                "id": numerical_id,
+                "payload": metadata_dict,
+                "intent": intent,
+                "detailed_explanation": detailed_explanation,
+                "hunk_id": hunk_id
+            })
+    
+
+    if points_to_upsert:
+
+        batch_size = 100  # Adjust based on API limits
+        for i in range(0, len(points_to_upsert), batch_size):
+            batch = points_to_upsert[i:i+batch_size]
+            print(f"Processing batch {i//batch_size + 1}/{(len(points_to_upsert) + batch_size - 1) // batch_size}")
+            
+
+            composite_texts = []
+            for p in batch:
+
+                if p["detailed_explanation"]:
+                    composite_text = f"Intent: {p['intent']}\nDetailed explanation: {p['detailed_explanation']}"
+                else:
+                    composite_text = p["intent"]
+                composite_texts.append(composite_text)
+            
+
+            embeddings = embed_texts_azure(composite_texts)
+            
+
+            points = [
+                PointStruct(
+                    id=p["id"],
+                    vector=embeddings[j].tolist(),
+                    payload=p["payload"]
+                )
+                for j, p in enumerate(batch)
+            ]
+            
+
+            qdrant_client.upsert(
+                collection_name=QDRANT_COLLECTION,
+                points=points
+            )
+            print(f"Upserted {len(points)} points to Qdrant")
+    
+    return all_metadata
+
+
+def search_with_llm_hierarchy(qdrant_client, metadata, hierarchy, query, top_k=5):
+    """
+    Search using the LLM-generated hierarchy, first checking if query exactly matches a category,
+    then falling back to Qdrant vector search if not.
+    """
+
+    categories_list = list(hierarchy.keys())
+    
+
+    exact_category_match = None
+    for category in categories_list:
+
+        if query.lower() == category.lower():
+            exact_category_match = category
+            break
+    
+    if not exact_category_match:
+
+        categories_str = ", ".join(categories_list)
+        
+        prompt = f"""
+You have a list of code change categories:
+{categories_str}
+
+Does the query "{query}" EXACTLY match any of these categories? 
+Only respond with the exact category name if it's a precise match.
+If it's related but not an exact match, respond with "None".
+If it's not related at all, respond with "None".
+
+Response:
+"""
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_CHAT,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50
+        )
+        
+        category_match = response.choices[0].message.content.strip()
+        
+
+        if category_match in hierarchy:
+            exact_category_match = category_match
+    
+    if exact_category_match:
+
+        print(f"Found exact category match: {exact_category_match}")
+        matching_intents = hierarchy[exact_category_match]
+        
+
+        result_points = []
+        for intent in matching_intents:
+
+            intent_filter = qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="intent",
+                        match=qmodels.MatchText(text=intent)
+                    )
+                ]
+            )
+            
+            response = qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                scroll_filter=intent_filter,
+                limit=top_k // len(matching_intents) + 1  # Distribute top_k across intents
+            )[0]
+            
+            result_points.extend([p.payload for p in response])
+        
+
+        if len(result_points) > top_k:
+
+            composite_texts = []
+            for item in result_points:
+
+                intent = item["intent"]
+                detailed_explanation = item.get("detailed_explanation", "")
+                if detailed_explanation:
+                    composite_text = f"Intent: {intent}\nDetailed explanation: {detailed_explanation}"
+                else:
+                    composite_text = intent
+                composite_texts.append(composite_text)
+                
+            item_embeddings = embed_texts_azure(composite_texts)
+            query_embedding = embed_texts_azure([query])[0]
+            
+
+            similarities = np.dot(item_embeddings, query_embedding)
+            sorted_indices = np.argsort(-similarities)  # Descending order
+            
+
+            result_points = [result_points[idx] for idx in sorted_indices[:top_k]]
+        
+        return result_points
+    else:
+
+        print("No exact category match, falling back to embedding search")
+        query_embedding = embed_texts_azure([query])[0]
+        
+
+        search_result = qdrant_client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=query_embedding.tolist(),
+            limit=top_k
+        )
+        
+
+        return [point.payload for point in search_result]
+
+
+def generate_developer_response(query: str, hunks_info: List[Dict], max_tokens=7000) -> str:
+    combined_hunks = ""
+    token_count = 0
+    base_prompt_tokens = 500
+    query_tokens = len(query) // 4
+    available_tokens = max_tokens - base_prompt_tokens - query_tokens
+    
+    for item in hunks_info:
+        item_text = f"Hunk:\n{item['hunk_text']}\n"
+        if item.get('commit_type'):
+            item_text += f"Commit Type: {item.get('commit_type')}\n"
+        if item.get('jira_ids'):
+            item_text += f"JIRA IDs: {item.get('jira_ids')}\n"
+        if item.get('jira_details'):
+            item_text += f"JIRA Details: {item.get('jira_details')}\n"
+        if item.get('detailed_explanation'):
+            item_text += f"Detailed Explanation: {item.get('detailed_explanation')}\n"
+        item_text += f"Intent: {item.get('intent', '')}\n\n"
+        
+        item_tokens = len(item_text) // 4
+        if token_count + item_tokens > available_tokens:
+            combined_hunks += "Note: Some hunks were omitted due to token limits.\n"
+            break
+            
+        combined_hunks += item_text
+        token_count += item_tokens
+    
     prompt = f"""
-You are a senior engineer, Always answer based on the context don't answer outside of context if can't answer then simply say can't find relevant commit. Continue this conversation based on previous context and commit summaries.
-Previous Conversation:
-{context}
+You are a senior Haskell developer assistant.
 
-New Context from Commits:
-{commits_context}
+You are given:
+- A user request describing a task.
+- Related code diffs (hunks) with associated JIRA information, commit types, and intent descriptions.
 
-New Question: {latest_question}
-Answer:
+Here is the user task:
+{query}
+
+Here are the related code hunks with metadata:
+{combined_hunks}
+
+Your job is to:
+
+1. **Explain the code hunks**: Summarize what the provided code hunks are doing in clear, simple English.
+2. **Formulate a plan**: Based on the task, explain the steps needed to implement the task using the information from the code hunks. Write the steps in simple English.
+3. **Generate code**: Write the Haskell code needed to complete the task.
+4. **Specify file locations**: For each code snippet you generate, mention the file path where it should be placed. (Use the file path information from the git diff.)
+
+Answer in the following format:
+
+---
+
+**Explanation of the provided code hunks:**
+<your explanation>
+
+**Steps to complete the task:**
+<list of steps>
+
+**Generated Code and File Paths:**
+- File: `<file_path_1>`
+```haskell
+<code_snippet_1>
+:
 """
     response = client.chat.completions.create(
         model=DEPLOYMENT_CHAT,
         messages=[{"role": "user", "content": prompt}]
     )
-
     return response.choices[0].message.content.strip()
 
-# --- Streamlit Chatbot UI ---
-def run_streamlit_app(index, metadata):
-    st.title("🔎 Commit History Chatbot (Smart Chunking + Memory)")
+
+@st.cache_data
+def load_commits(max_count):
+    return fetch_commits(max_count)
+
+@st.cache_data
+def load_grouped_hunks(commits):
+    return group_hunks_by_intent(commits)
+
+@st.cache_data
+def load_intent_hierarchy(grouped_hunks):
+    return group_intents_with_llm(grouped_hunks)
+
+@st.cache_resource
+def load_qdrant_client():
+    return init_qdrant_client()
+
+@st.cache_data
+def load_qdrant_metadata(_qdrant_client, grouped_hunks):
+    return build_qdrant_db(_qdrant_client, grouped_hunks)
+
+
+def run_streamlit_app(qdrant_client, metadata, intent_hierarchy):
+    st.title("🔍 Git Diff Hunks Chatbot (Qdrant + Hierarchical Intent)")
 
     if 'conversation' not in st.session_state:
         st.session_state.conversation = []
 
-    if st.button("Clear Conversation"):
-        st.session_state.conversation = []
+    st.sidebar.header("Filters")
+    commit_types = ["all", "feature", "bugfix", "refactor", "documentation", "test", "other"]
+    selected_type = st.sidebar.selectbox("Filter by commit type", commit_types)
+
+
+    st.sidebar.header("Intent Categories")
+    for high_level, low_levels in intent_hierarchy.items():
+        with st.sidebar.expander(f"📁 {high_level}"):
+            for intent in low_levels:
+                st.write(f"- {intent}")
+
+    if st.sidebar.button("🔄 Refresh All Data"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+
+        try:
+            qdrant_client.delete_collection(collection_name=QDRANT_COLLECTION)
+            print(f"Deleted Qdrant collection: {QDRANT_COLLECTION}")
+        except Exception as e:
+            print(f"Error deleting collection: {e}")
+
+        if os.path.exists(HIERARCHY_CACHE_FILE):
+            os.remove(HIERARCHY_CACHE_FILE)
+        st.experimental_rerun()
 
     query = st.text_input("Ask a question about your codebase:")
 
@@ -299,19 +756,44 @@ def run_streamlit_app(index, metadata):
         st.session_state.conversation.append({"question": query, "answer": ""})
 
         with st.spinner("Thinking..."):
-            answer = answer_query(index, metadata, st.session_state.conversation)
-            st.session_state.conversation[-1]['answer'] = answer
+            relevant_hunks = search_with_llm_hierarchy(qdrant_client, metadata, intent_hierarchy, query)
+            if selected_type != "all":
+                relevant_hunks = [h for h in relevant_hunks if h.get('commit_type') == selected_type]
+            if not relevant_hunks:
+                st.session_state.conversation[-1]['answer'] = "No relevant code changes found."
+            else:
+                answer = generate_developer_response(query, relevant_hunks)
+                st.session_state.conversation[-1]['answer'] = answer
 
     for turn in st.session_state.conversation:
         st.markdown(f"**You:** {turn['question']}")
         st.markdown(f"**Bot:** {turn['answer']}")
 
-# --- MAIN FLOW ---
+
+def main():
+    st.sidebar.title("⚙️ Settings")
+    max_commits = st.sidebar.slider("Number of commits to analyze", 10, 200, 50)
+    
+    with st.spinner("Loading and indexing commits..."):
+        commits = load_commits(max_count=3)
+        print(f"Commits loaded: {len(commits)}")
+    
+    with st.spinner("Splitting diffs into hunks and grouping by intent..."):
+        grouped_hunks = load_grouped_hunks(commits)
+        print(f"Unique intents found: {len(grouped_hunks)}")
+    
+    with st.spinner("Building LLM-based intent hierarchy..."):
+        intent_hierarchy = load_intent_hierarchy(grouped_hunks)
+        print(f"Created {len(intent_hierarchy)} high-level categories")
+    
+    with st.spinner("Building Qdrant vector database..."):
+        qdrant_client = load_qdrant_client()
+
+        metadata = load_qdrant_metadata(qdrant_client, grouped_hunks)
+        print(f"Vector database built with {len(metadata)} entries")
+
+    run_streamlit_app(qdrant_client, metadata, intent_hierarchy)
+
+
 if __name__ == "__main__":
-    print("Fetching commits...")
-    all_commits = fetch_commits(max_count=2)
-
-    index, metadata = build_vector_db(all_commits)
-
-    run_streamlit_app(index, metadata)
-
+    main()
